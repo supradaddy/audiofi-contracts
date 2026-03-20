@@ -1,0 +1,13 @@
+[package]
+name = "audiofi"
+version = "0.1.0"
+authors = ["AudioFi"]
+license = "Apache-2.0"
+
+[addresses]
+audiofi = "0x1c7d6154b0486d7eb05a783788b883d243d3ae4cc3725a7cc50670ffc7d20a76"
+
+[dependencies.SupraFramework]
+git = "https://github.com/Entropy-Foundation/aptos-core.git"
+rev = "dev"
+subdir = "aptos-move/framework/supra-framework"
