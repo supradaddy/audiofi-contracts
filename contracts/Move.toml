@@ -5,7 +5,7 @@ authors = ["AudioFi"]
 license = "Apache-2.0"
 
 [addresses]
-audiofi = "0x1c7d6154b0486d7eb05a783788b883d243d3ae4cc3725a7cc50670ffc7d20a76"
+audiofi = "0x5bf26c7f9e8e5c0d547e74baf079a072171dfe2051254fde4d5141059c938b68"
 
 [dependencies.SupraFramework]
 git = "https://github.com/Entropy-Foundation/aptos-core.git"

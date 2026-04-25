@@ -1,24 +1,38 @@
-module audiofi::audiofi_aufi_rewards {
+/// Daily AUFI emission settlement.
+///
+/// Splits a fraction of the AUFI vault into a per-day Subscriber pool
+/// and a per-day Curator pool, and accrues per-user payouts off a
+/// Merkle-attested daily batch from the off-chain oracle. Users claim
+/// their accrued AUFI after `epoch_secs` (default 30 days).
+///
+/// NOTE: Amplify staker rewards are NOT distributed by this module any
+/// more. The amplify vault (`audiofi_amplify_vault`) is now a standalone
+/// fixed-APR program; its rewards are routed directly into each
+/// staker's `audiofi_user_vault` as a 30-day-locked tranche.
+module audiofi::audiofi_aufi_settlement_v2 {
 
     use std::bcs;
     use std::signer;
     use std::table;
     use std::vector;
 
-    use supra_framework::coin;
     use supra_framework::event;
+    use supra_framework::fungible_asset;
+    use supra_framework::object;
+    use supra_framework::primary_fungible_store;
     use supra_framework::timestamp;
 
-    use audiofi::audiofi_subscriber_graph;
+    use audiofi::audiofi_oracle_attest;
 
+    const AUFI_SEED: vector<u8> = b"TestAUFIv4";
+    const VAULT_SEED: vector<u8> = b"AudioFiAufiSettlementVault";
 
     const BPS_DENOM: u64 = 10000;
     const SECONDS_PER_YEAR: u64 = 365 * 24 * 60 * 60;
 
     const DEFAULT_ANNUAL_EMISSION_BPS: u64 = 1800;
-    const DEFAULT_SUBSCRIBER_POOL_BPS: u64 = 6000;
+    const DEFAULT_SUBSCRIBER_POOL_BPS: u64 = 8000;
     const DEFAULT_CURATOR_POOL_BPS: u64 = 2000;
-    const DEFAULT_AMPLIFY_POOL_BPS: u64 = 2000;
     const DEFAULT_MAX_SHARE_BPS: u64 = 100;
 
     const DEFAULT_EPOCH_SECS: u64 = 30 * 24 * 60 * 60;
@@ -31,12 +45,13 @@ module audiofi::audiofi_aufi_rewards {
     const E_BAD_DAY: u64 = 20;
     const E_DAY_NOT_SEALED: u64 = 21;
     const E_DAY_ALREADY_SEALED: u64 = 22;
+    const E_DAY_ROOT_NOT_COMMITTED: u64 = 26;
+    const E_BATCH_ROOT_MISMATCH: u64 = 27;
     const E_BAD_POOL_SPLIT: u64 = 23;
     const E_BAD_PARAMS: u64 = 24;
     const E_DUPLICATE_ADDRESS: u64 = 25;
     const E_NOTHING_TO_CLAIM: u64 = 50;
     const E_EPOCH_NOT_ELAPSED: u64 = 53;
-    const E_NO_AMPLIFY_PENDING: u64 = 54;
     const E_ALREADY_INITIALIZED: u64 = 1000;
 
 
@@ -45,7 +60,6 @@ module audiofi::audiofi_aufi_rewards {
         admin: address,
         system: address,
         oracle: address,
-        registry_admin: address,
         paused: bool,
         ts: u64,
     }
@@ -59,7 +73,6 @@ module audiofi::audiofi_aufi_rewards {
         emitted: u64,
         subscriber_pool: u64,
         curator_pool: u64,
-        amplify_pool: u64,
         ts: u64,
     }
 
@@ -68,16 +81,12 @@ module audiofi::audiofi_aufi_rewards {
     #[event]
     struct CuratorDaySubmittedEvent has drop, store { day_id: u64, curator: address, base_units: u64, effective_units: u128, ts: u64 }
     #[event]
-    struct AmplifyDaySubmittedEvent has drop, store { day_id: u64, staker: address, base_units: u64, effective_units: u128, ts: u64 }
-    #[event]
     struct DaySealedEvent has drop, store {
         day_id: u64,
         total_subscriber_eff: u128,
         total_curator_eff: u128,
-        total_amplify_eff: u128,
         subscriber_pool: u64,
         curator_pool: u64,
-        amplify_pool: u64,
         ts: u64,
     }
 
@@ -85,20 +94,15 @@ module audiofi::audiofi_aufi_rewards {
     struct AccruedSubscriberEvent has drop, store { day_id: u64, user: address, accrued: u64, total_pending: u64, ts: u64 }
     #[event]
     struct AccruedCuratorEvent has drop, store { day_id: u64, curator: address, accrued: u64, total_pending: u64, ts: u64 }
-    #[event]
-    struct AccruedAmplifyEvent has drop, store { day_id: u64, staker: address, accrued: u64, total_pending: u64, ts: u64 }
 
     #[event]
     struct RewardsClaimedEvent has drop, store { user: address, claimed: u64, ts: u64 }
 
-    // AmplifyRewardReductionEvent removed — no early exit penalties in the fixed APR model
 
-
-    struct Config<phantom AufiCoinType, phantom SubCoinType> has key {
+    struct Config has key {
         admin: address,
         system: address,
         oracle: address,
-        registry_admin: address,
         paused: bool,
 
         current_day_id: u64,
@@ -106,13 +110,13 @@ module audiofi::audiofi_aufi_rewards {
         annual_emission_bps: u64,
         subscriber_pool_bps: u64,
         curator_pool_bps: u64,
-        amplify_pool_bps: u64,
         max_share_bps: u64,
         last_emission_ts: u64,
 
         epoch_secs: u64,
 
-        vault: coin::Coin<AufiCoinType>,
+        vault_balance: u64,
+        vault_extend_ref: object::ExtendRef,
 
         subscriber_effective: table::Table<vector<u8>, u128>,
         subscriber_total: table::Table<u64, u128>,
@@ -120,21 +124,15 @@ module audiofi::audiofi_aufi_rewards {
         curator_effective: table::Table<vector<u8>, u128>,
         curator_total: table::Table<u64, u128>,
 
-        amplify_effective: table::Table<vector<u8>, u128>,
-        amplify_total: table::Table<u64, u128>,
-
         subscriber_pool: table::Table<u64, u64>,
         curator_pool: table::Table<u64, u64>,
-        amplify_pool: table::Table<u64, u64>,
 
         day_sealed: table::Table<u64, bool>,
 
         claimed_subscriber: table::Table<vector<u8>, bool>,
         claimed_curator: table::Table<vector<u8>, bool>,
-        claimed_amplify: table::Table<vector<u8>, bool>,
 
         pending_rewards: table::Table<vector<u8>, u64>,
-        pending_amplify_rewards: table::Table<vector<u8>, u64>,
         epoch_start_ts: table::Table<vector<u8>, u64>,
     }
 
@@ -148,10 +146,19 @@ module audiofi::audiofi_aufi_rewards {
     }
 
 
-    fun assert_admin<A, S>(cfg: &Config<A, S>, caller: address) { assert!(caller == cfg.admin, E_NOT_ADMIN); }
-    fun assert_oracle<A, S>(cfg: &Config<A, S>, caller: address) { assert!(caller == cfg.oracle, E_NOT_ORACLE); }
-    fun assert_admin_or_system<A, S>(cfg: &Config<A, S>, caller: address) { assert!(caller == cfg.admin || caller == cfg.system, E_NOT_SYSTEM_OR_ADMIN); }
-    fun assert_not_paused<A, S>(cfg: &Config<A, S>) { assert!(!cfg.paused, E_PAUSED); }
+    fun assert_admin(cfg: &Config, caller: address) { assert!(caller == cfg.admin, E_NOT_ADMIN); }
+    fun assert_oracle(cfg: &Config, caller: address) { assert!(caller == cfg.oracle, E_NOT_ORACLE); }
+    fun assert_admin_or_system(cfg: &Config, caller: address) { assert!(caller == cfg.admin || caller == cfg.system, E_NOT_SYSTEM_OR_ADMIN); }
+    fun assert_not_paused(cfg: &Config) { assert!(!cfg.paused, E_PAUSED); }
+
+    fun get_aufi_metadata(): object::Object<fungible_asset::Metadata> {
+        let addr = object::create_object_address(&@audiofi, AUFI_SEED);
+        object::address_to_object<fungible_asset::Metadata>(addr)
+    }
+
+    fun get_vault_address(): address {
+        object::create_object_address(&@audiofi, VAULT_SEED)
+    }
 
     fun is_true_day(t: &table::Table<u64, bool>, k: u64): bool {
         if (table::contains(t, k)) *table::borrow(t, k) else false
@@ -199,37 +206,41 @@ module audiofi::audiofi_aufi_rewards {
     }
 
 
-    public entry fun initialize<AufiCoinType, SubCoinType>(
+    public entry fun initialize(
         admin_signer: &signer,
         system: address,
         oracle: address,
-        registry_admin: address,
     ) {
         let admin = signer::address_of(admin_signer);
-        assert!(!exists<Config<AufiCoinType, SubCoinType>>(admin), E_ALREADY_INITIALIZED);
+        assert!(!exists<Config>(admin), E_ALREADY_INITIALIZED);
         assert!(
-            DEFAULT_SUBSCRIBER_POOL_BPS + DEFAULT_CURATOR_POOL_BPS + DEFAULT_AMPLIFY_POOL_BPS == BPS_DENOM,
+            DEFAULT_SUBSCRIBER_POOL_BPS + DEFAULT_CURATOR_POOL_BPS == BPS_DENOM,
             E_BAD_POOL_SPLIT
         );
 
-        move_to(admin_signer, Config<AufiCoinType, SubCoinType> {
+        let constructor_ref = object::create_named_object(admin_signer, VAULT_SEED);
+        let extend_ref = object::generate_extend_ref(&constructor_ref);
+        let vault_addr = object::address_from_constructor_ref(&constructor_ref);
+        let metadata = get_aufi_metadata();
+        primary_fungible_store::ensure_primary_store_exists(vault_addr, metadata);
+
+        move_to(admin_signer, Config {
             admin,
             system,
             oracle,
-            registry_admin,
             paused: false,
             current_day_id: 0,
 
             annual_emission_bps: DEFAULT_ANNUAL_EMISSION_BPS,
             subscriber_pool_bps: DEFAULT_SUBSCRIBER_POOL_BPS,
             curator_pool_bps: DEFAULT_CURATOR_POOL_BPS,
-            amplify_pool_bps: DEFAULT_AMPLIFY_POOL_BPS,
             max_share_bps: DEFAULT_MAX_SHARE_BPS,
             last_emission_ts: timestamp::now_seconds(),
 
             epoch_secs: DEFAULT_EPOCH_SECS,
 
-            vault: coin::zero<AufiCoinType>(),
+            vault_balance: 0,
+            vault_extend_ref: extend_ref,
 
             subscriber_effective: table::new(),
             subscriber_total: table::new(),
@@ -237,85 +248,77 @@ module audiofi::audiofi_aufi_rewards {
             curator_effective: table::new(),
             curator_total: table::new(),
 
-            amplify_effective: table::new(),
-            amplify_total: table::new(),
-
             subscriber_pool: table::new(),
             curator_pool: table::new(),
-            amplify_pool: table::new(),
 
             day_sealed: table::new(),
             claimed_subscriber: table::new(),
             claimed_curator: table::new(),
-            claimed_amplify: table::new(),
 
             pending_rewards: table::new(),
-            pending_amplify_rewards: table::new(),
             epoch_start_ts: table::new(),
         });
 
-        event::emit(ConfigUpdatedEvent { admin, system, oracle, registry_admin, paused: false, ts: timestamp::now_seconds() });
+        event::emit(ConfigUpdatedEvent { admin, system, oracle, paused: false, ts: timestamp::now_seconds() });
     }
 
 
-    public entry fun set_params<AufiCoinType, SubCoinType>(
+    public entry fun set_params(
         admin_signer: &signer,
         admin_addr: address,
         system: address,
         oracle: address,
-        registry_admin: address,
         paused: bool,
         annual_emission_bps: u64,
         subscriber_pool_bps: u64,
         curator_pool_bps: u64,
-        amplify_pool_bps: u64,
         max_share_bps: u64,
         epoch_secs: u64,
     ) acquires Config {
         let admin = signer::address_of(admin_signer);
-        let cfg = borrow_global_mut<Config<AufiCoinType, SubCoinType>>(admin_addr);
+        let cfg = borrow_global_mut<Config>(admin_addr);
         assert_admin(cfg, admin);
-        assert!(subscriber_pool_bps + curator_pool_bps + amplify_pool_bps == BPS_DENOM, E_BAD_POOL_SPLIT);
+        assert!(subscriber_pool_bps + curator_pool_bps == BPS_DENOM, E_BAD_POOL_SPLIT);
         assert!(max_share_bps <= BPS_DENOM, E_BAD_PARAMS);
         assert!(annual_emission_bps <= BPS_DENOM, E_BAD_PARAMS);
         assert!(epoch_secs >= 7 * 24 * 60 * 60, E_BAD_PARAMS);
 
         cfg.system = system;
         cfg.oracle = oracle;
-        cfg.registry_admin = registry_admin;
         cfg.paused = paused;
         cfg.annual_emission_bps = annual_emission_bps;
         cfg.subscriber_pool_bps = subscriber_pool_bps;
         cfg.curator_pool_bps = curator_pool_bps;
-        cfg.amplify_pool_bps = amplify_pool_bps;
         cfg.max_share_bps = max_share_bps;
         cfg.epoch_secs = epoch_secs;
 
-        event::emit(ConfigUpdatedEvent { admin: admin_addr, system, oracle, registry_admin, paused, ts: timestamp::now_seconds() });
+        event::emit(ConfigUpdatedEvent { admin: admin_addr, system, oracle, paused, ts: timestamp::now_seconds() });
     }
 
-    public entry fun fund_vault<AufiCoinType, SubCoinType>(
+    public entry fun fund_vault(
         admin_signer: &signer,
         admin_addr: address,
         amount: u64
     ) acquires Config {
         let admin = signer::address_of(admin_signer);
-        let cfg = borrow_global_mut<Config<AufiCoinType, SubCoinType>>(admin_addr);
+        let cfg = borrow_global_mut<Config>(admin_addr);
         assert_admin(cfg, admin);
 
-        let c = coin::withdraw<AufiCoinType>(admin_signer, amount);
-        coin::merge(&mut cfg.vault, c);
+        let metadata = get_aufi_metadata();
+        let vault_addr = get_vault_address();
+        primary_fungible_store::transfer(admin_signer, metadata, vault_addr, amount);
+        cfg.vault_balance = cfg.vault_balance + amount;
 
-        event::emit(VaultFundedEvent { amount, vault_balance: coin::value(&cfg.vault), ts: timestamp::now_seconds() });
+        event::emit(VaultFundedEvent { amount, vault_balance: cfg.vault_balance, ts: timestamp::now_seconds() });
     }
 
 
-    fun emit_for_day<AufiCoinType, SubCoinType>(cfg: &mut Config<AufiCoinType, SubCoinType>) {
+    fun emit_for_day(cfg: &mut Config) {
         let now = timestamp::now_seconds();
         let dt = now - cfg.last_emission_ts;
         cfg.last_emission_ts = now;
 
-        let vault_balance = coin::value(&cfg.vault);
+        let vault_balance = cfg.vault_balance;
         let emitted = (
             (vault_balance as u128)
             * (cfg.annual_emission_bps as u128)
@@ -327,27 +330,24 @@ module audiofi::audiofi_aufi_rewards {
 
         let subscriber_pool_amt = (emitted_u64 * cfg.subscriber_pool_bps) / BPS_DENOM;
         let curator_pool_amt = (emitted_u64 * cfg.curator_pool_bps) / BPS_DENOM;
-        let amplify_pool_amt = (emitted_u64 * cfg.amplify_pool_bps) / BPS_DENOM;
 
         table_upsert_u64(&mut cfg.subscriber_pool, cfg.current_day_id, subscriber_pool_amt);
         table_upsert_u64(&mut cfg.curator_pool, cfg.current_day_id, curator_pool_amt);
-        table_upsert_u64(&mut cfg.amplify_pool, cfg.current_day_id, amplify_pool_amt);
 
         event::emit(EmissionEvent {
             day_id: cfg.current_day_id,
             emitted: emitted_u64,
             subscriber_pool: subscriber_pool_amt,
             curator_pool: curator_pool_amt,
-            amplify_pool: amplify_pool_amt,
             ts: now,
         });
     }
 
-    public entry fun start_new_day<AufiCoinType, SubCoinType>(
+    public entry fun start_new_day(
         caller: &signer,
         admin_addr: address
     ) acquires Config {
-        let cfg = borrow_global_mut<Config<AufiCoinType, SubCoinType>>(admin_addr);
+        let cfg = borrow_global_mut<Config>(admin_addr);
         assert_not_paused(cfg);
         assert_admin_or_system(cfg, signer::address_of(caller));
 
@@ -356,7 +356,7 @@ module audiofi::audiofi_aufi_rewards {
     }
 
 
-    public entry fun submit_day_batch<AufiCoinType, SubCoinType>(
+    public entry fun submit_day_batch(
         oracle_signer: &signer,
         admin_addr: address,
         day_id: u64,
@@ -364,21 +364,29 @@ module audiofi::audiofi_aufi_rewards {
         subscriber_units: vector<u64>,
         curators: vector<address>,
         curator_units: vector<u64>,
-        amplify_stakers: vector<address>,
-        amplify_units: vector<u64>,
-        amplify_artists: vector<address>,
+        batch_root: vector<u8>,
     ) acquires Config {
-        let cfg = borrow_global_mut<Config<AufiCoinType, SubCoinType>>(admin_addr);
+        let cfg = borrow_global_mut<Config>(admin_addr);
         assert_not_paused(cfg);
         assert_oracle(cfg, signer::address_of(oracle_signer));
         assert!(day_id <= cfg.current_day_id, E_BAD_DAY);
         assert!(!is_true_day(&cfg.day_sealed, day_id), E_DAY_ALREADY_SEALED);
+        assert!(
+            audiofi_oracle_attest::view_day_attestation_committed(admin_addr, day_id),
+            E_DAY_ROOT_NOT_COMMITTED
+        );
+        assert!(
+            audiofi_oracle_attest::view_user_batch_root_matches(admin_addr, day_id, batch_root),
+            E_BATCH_ROOT_MISMATCH
+        );
         assert!(vector::length(&subscribers) == vector::length(&subscriber_units), 12001);
         assert!(vector::length(&curators) == vector::length(&curator_units), 12002);
-        assert!(vector::length(&amplify_stakers) == vector::length(&amplify_units), 12003);
-        assert!(vector::length(&amplify_stakers) == vector::length(&amplify_artists), 12004);
 
-        let registry_admin = cfg.registry_admin;
+        // Caller (oracle) MUST have pre-filtered the inputs to active
+        // superfan subscribers / verified curators only; the batch_root
+        // cryptographically commits to the exact set of addresses being
+        // credited, so any off-chain manipulation will fail attestation
+        // verification.
         let now = timestamp::now_seconds();
 
         let total_subscriber: u128 = 0;
@@ -386,12 +394,6 @@ module audiofi::audiofi_aufi_rewards {
         let n_subscribers = vector::length(&subscribers);
         while (i < n_subscribers) {
             let u = *vector::borrow(&subscribers, i);
-
-            let active = audiofi_subscriber_graph::is_active_subscriber(registry_admin, u);
-            if (!active) {
-                i = i + 1;
-                continue
-            };
 
             let kdu = key_day_user(day_id, u);
             assert!(!table::contains(&cfg.subscriber_effective, kdu), E_DUPLICATE_ADDRESS);
@@ -418,12 +420,6 @@ module audiofi::audiofi_aufi_rewards {
         while (j < n_curators) {
             let c = *vector::borrow(&curators, j);
 
-            let active = audiofi_subscriber_graph::is_active_subscriber(registry_admin, c);
-            if (!active) {
-                j = j + 1;
-                continue
-            };
-
             let kdc = key_day_user(day_id, c);
             assert!(!table::contains(&cfg.curator_effective, kdc), E_DUPLICATE_ADDRESS);
 
@@ -442,60 +438,19 @@ module audiofi::audiofi_aufi_rewards {
             j = j + 1;
         };
 
-        let total_amplify: u128 = 0;
-        let m: u64 = 0;
-        let n_amplify = vector::length(&amplify_stakers);
-        while (m < n_amplify) {
-            let s = *vector::borrow(&amplify_stakers, m);
-            let amplified_artist = *vector::borrow(&amplify_artists, m);
-
-            if (s == amplified_artist) {
-                m = m + 1;
-                continue
-            };
-
-            let active = audiofi_subscriber_graph::is_active_subscriber(registry_admin, s);
-            if (!active) {
-                m = m + 1;
-                continue
-            };
-
-            let kds = key_day_user(day_id, s);
-            assert!(!table::contains(&cfg.amplify_effective, kds), E_DUPLICATE_ADDRESS);
-
-            let base = (*vector::borrow(&amplify_units, m) as u128);
-            let eff = base;
-            table_upsert_vec(&mut cfg.amplify_effective, kds, eff);
-            total_amplify = total_amplify + eff;
-
-            event::emit(AmplifyDaySubmittedEvent {
-                day_id,
-                staker: s,
-                base_units: *vector::borrow(&amplify_units, m),
-                effective_units: eff,
-                ts: now,
-            });
-
-            m = m + 1;
-        };
-
         table_upsert_u128(&mut cfg.subscriber_total, day_id, total_subscriber);
         table_upsert_u128(&mut cfg.curator_total, day_id, total_curator);
-        table_upsert_u128(&mut cfg.amplify_total, day_id, total_amplify);
         table_upsert_bool(&mut cfg.day_sealed, day_id, true);
 
         let sp = if (table::contains(&cfg.subscriber_pool, day_id)) *table::borrow(&cfg.subscriber_pool, day_id) else 0;
         let cp = if (table::contains(&cfg.curator_pool, day_id)) *table::borrow(&cfg.curator_pool, day_id) else 0;
-        let ap = if (table::contains(&cfg.amplify_pool, day_id)) *table::borrow(&cfg.amplify_pool, day_id) else 0;
 
         event::emit(DaySealedEvent {
             day_id,
             total_subscriber_eff: total_subscriber,
             total_curator_eff: total_curator,
-            total_amplify_eff: total_amplify,
             subscriber_pool: sp,
             curator_pool: cp,
-            amplify_pool: ap,
             ts: now,
         });
     }
@@ -508,7 +463,7 @@ module audiofi::audiofi_aufi_rewards {
         if (raw > max_allowed) { max_allowed } else { raw }
     }
 
-    fun accrue<AufiCoinType, SubCoinType>(cfg: &mut Config<AufiCoinType, SubCoinType>, user: address, payout: u64) {
+    fun accrue(cfg: &mut Config, user: address, payout: u64) {
         let ku = key_addr(user);
         let current = get_pending(&cfg.pending_rewards, &ku);
         if (current == 0) {
@@ -519,13 +474,13 @@ module audiofi::audiofi_aufi_rewards {
     }
 
 
-    public entry fun auto_claim_subscriber_batch<AufiCoinType, SubCoinType>(
+    public entry fun auto_claim_subscriber_batch(
         caller: &signer,
         admin_addr: address,
         day_id: u64,
         users: vector<address>
     ) acquires Config {
-        let cfg = borrow_global_mut<Config<AufiCoinType, SubCoinType>>(admin_addr);
+        let cfg = borrow_global_mut<Config>(admin_addr);
         assert_admin_or_system(cfg, signer::address_of(caller));
         assert_not_paused(cfg);
         assert!(is_true_day(&cfg.day_sealed, day_id), E_DAY_NOT_SEALED);
@@ -556,13 +511,13 @@ module audiofi::audiofi_aufi_rewards {
         };
     }
 
-    public entry fun auto_claim_curator_batch<AufiCoinType, SubCoinType>(
+    public entry fun auto_claim_curator_batch(
         caller: &signer,
         admin_addr: address,
         day_id: u64,
         curators: vector<address>
     ) acquires Config {
-        let cfg = borrow_global_mut<Config<AufiCoinType, SubCoinType>>(admin_addr);
+        let cfg = borrow_global_mut<Config>(admin_addr);
         assert_admin_or_system(cfg, signer::address_of(caller));
         assert_not_paused(cfg);
         assert!(is_true_day(&cfg.day_sealed, day_id), E_DAY_NOT_SEALED);
@@ -593,143 +548,84 @@ module audiofi::audiofi_aufi_rewards {
         };
     }
 
-    public entry fun auto_claim_amplify_batch<AufiCoinType, SubCoinType>(
-        caller: &signer,
-        admin_addr: address,
-        day_id: u64,
-        stakers: vector<address>
-    ) acquires Config {
-        let cfg = borrow_global_mut<Config<AufiCoinType, SubCoinType>>(admin_addr);
-        assert_admin_or_system(cfg, signer::address_of(caller));
-        assert_not_paused(cfg);
-        assert!(is_true_day(&cfg.day_sealed, day_id), E_DAY_NOT_SEALED);
 
-        let now = timestamp::now_seconds();
-        let total = *table::borrow(&cfg.amplify_total, day_id);
-        let pool = if (table::contains(&cfg.amplify_pool, day_id)) *table::borrow(&cfg.amplify_pool, day_id) else 0;
-        let max_share = cfg.max_share_bps;
-
-        let i: u64 = 0;
-        let n = vector::length(&stakers);
-        while (i < n) {
-            let s = *vector::borrow(&stakers, i);
-            let kds = key_day_user(day_id, s);
-            let already = if (table::contains(&cfg.claimed_amplify, kds)) *table::borrow(&cfg.claimed_amplify, kds) else false;
-            if (!already) {
-                let eff = if (table::contains(&cfg.amplify_effective, kds)) *table::borrow(&cfg.amplify_effective, kds) else 0;
-                let payout = compute_payout(pool, eff, total, max_share);
-                if (payout > 0) {
-                    accrue(cfg, s, payout);
-
-                    let ks_amp = key_addr(s);
-                    let current_amp = get_pending(&cfg.pending_amplify_rewards, &ks_amp);
-                    table_upsert_vec(&mut cfg.pending_amplify_rewards, ks_amp, current_amp + payout);
-
-                    table_upsert_vec(&mut cfg.claimed_amplify, kds, true);
-                    let ks = key_addr(s);
-                    let new_pending = get_pending(&cfg.pending_rewards, &ks);
-                    event::emit(AccruedAmplifyEvent { day_id, staker: s, accrued: payout, total_pending: new_pending, ts: now });
-                };
-            };
-            i = i + 1;
-        };
-    }
-
-
-    public entry fun claim_rewards<AufiCoinType, SubCoinType>(
+    public entry fun claim_rewards(
         user_signer: &signer,
         admin_addr: address
     ) acquires Config {
         let user = signer::address_of(user_signer);
-        let cfg = borrow_global_mut<Config<AufiCoinType, SubCoinType>>(admin_addr);
+        let cfg = borrow_global_mut<Config>(admin_addr);
         assert_not_paused(cfg);
 
         let now = timestamp::now_seconds();
         let ku = key_addr(user);
         let pending = get_pending(&cfg.pending_rewards, &ku);
         assert!(pending > 0, E_NOTHING_TO_CLAIM);
-        assert!(coin::value(&cfg.vault) >= pending, E_NOTHING_TO_CLAIM);
+        assert!(cfg.vault_balance >= pending, E_NOTHING_TO_CLAIM);
 
         let epoch_start = get_epoch_start(&cfg.epoch_start_ts, &ku);
         assert!(now >= epoch_start + cfg.epoch_secs, E_EPOCH_NOT_ELAPSED);
 
-        let pay = coin::extract(&mut cfg.vault, pending);
-        coin::deposit<AufiCoinType>(user, pay);
+        cfg.vault_balance = cfg.vault_balance - pending;
+        let vault_signer = object::generate_signer_for_extending(&cfg.vault_extend_ref);
+        let metadata = get_aufi_metadata();
+        primary_fungible_store::transfer(&vault_signer, metadata, user, pending);
 
         table_upsert_vec(&mut cfg.pending_rewards, ku, 0);
-        let ku2 = key_addr(user);
-        table_upsert_vec(&mut cfg.pending_amplify_rewards, ku2, 0);
 
         event::emit(RewardsClaimedEvent { user, claimed: pending, ts: now });
     }
 
 
-    // apply_amplify_reward_reduction removed — no early exit penalties in the fixed APR model
-
-
     #[view]
-    public fun view_vault_balance<AufiCoinType, SubCoinType>(admin_addr: address): u64 acquires Config {
-        coin::value(&borrow_global<Config<AufiCoinType, SubCoinType>>(admin_addr).vault)
+    public fun view_vault_balance(admin_addr: address): u64 acquires Config {
+        borrow_global<Config>(admin_addr).vault_balance
     }
 
     #[view]
-    public fun view_current_day<AufiCoinType, SubCoinType>(admin_addr: address): u64 acquires Config {
-        borrow_global<Config<AufiCoinType, SubCoinType>>(admin_addr).current_day_id
+    public fun view_current_day(admin_addr: address): u64 acquires Config {
+        borrow_global<Config>(admin_addr).current_day_id
     }
 
     #[view]
-    public fun view_emission_params<AufiCoinType, SubCoinType>(admin_addr: address): (u64, u64, u64, u64, u64) acquires Config {
-        let cfg = borrow_global<Config<AufiCoinType, SubCoinType>>(admin_addr);
-        (cfg.annual_emission_bps, cfg.subscriber_pool_bps, cfg.curator_pool_bps, cfg.amplify_pool_bps, cfg.max_share_bps)
+    public fun view_emission_params(admin_addr: address): (u64, u64, u64, u64) acquires Config {
+        let cfg = borrow_global<Config>(admin_addr);
+        (cfg.annual_emission_bps, cfg.subscriber_pool_bps, cfg.curator_pool_bps, cfg.max_share_bps)
     }
 
     #[view]
-    public fun view_epoch_secs<AufiCoinType, SubCoinType>(admin_addr: address): u64 acquires Config {
-        borrow_global<Config<AufiCoinType, SubCoinType>>(admin_addr).epoch_secs
+    public fun view_epoch_secs(admin_addr: address): u64 acquires Config {
+        borrow_global<Config>(admin_addr).epoch_secs
     }
 
     #[view]
-    public fun view_subscriber_pool<AufiCoinType, SubCoinType>(admin_addr: address, day_id: u64): u64 acquires Config {
-        let cfg = borrow_global<Config<AufiCoinType, SubCoinType>>(admin_addr);
+    public fun view_subscriber_pool(admin_addr: address, day_id: u64): u64 acquires Config {
+        let cfg = borrow_global<Config>(admin_addr);
         if (table::contains(&cfg.subscriber_pool, day_id)) *table::borrow(&cfg.subscriber_pool, day_id) else 0
     }
 
     #[view]
-    public fun view_curator_pool<AufiCoinType, SubCoinType>(admin_addr: address, day_id: u64): u64 acquires Config {
-        let cfg = borrow_global<Config<AufiCoinType, SubCoinType>>(admin_addr);
+    public fun view_curator_pool(admin_addr: address, day_id: u64): u64 acquires Config {
+        let cfg = borrow_global<Config>(admin_addr);
         if (table::contains(&cfg.curator_pool, day_id)) *table::borrow(&cfg.curator_pool, day_id) else 0
     }
 
     #[view]
-    public fun view_amplify_pool<AufiCoinType, SubCoinType>(admin_addr: address, day_id: u64): u64 acquires Config {
-        let cfg = borrow_global<Config<AufiCoinType, SubCoinType>>(admin_addr);
-        if (table::contains(&cfg.amplify_pool, day_id)) *table::borrow(&cfg.amplify_pool, day_id) else 0
+    public fun view_day_sealed(admin_addr: address, day_id: u64): bool acquires Config {
+        is_true_day(&borrow_global<Config>(admin_addr).day_sealed, day_id)
     }
 
     #[view]
-    public fun view_day_sealed<AufiCoinType, SubCoinType>(admin_addr: address, day_id: u64): bool acquires Config {
-        is_true_day(&borrow_global<Config<AufiCoinType, SubCoinType>>(admin_addr).day_sealed, day_id)
-    }
-
-    #[view]
-    public fun view_pending_rewards<AufiCoinType, SubCoinType>(admin_addr: address, user: address): u64 acquires Config {
-        let cfg = borrow_global<Config<AufiCoinType, SubCoinType>>(admin_addr);
+    public fun view_pending_rewards(admin_addr: address, user: address): u64 acquires Config {
+        let cfg = borrow_global<Config>(admin_addr);
         let ku = key_addr(user);
         get_pending(&cfg.pending_rewards, &ku)
     }
 
     #[view]
-    public fun view_epoch_start<AufiCoinType, SubCoinType>(admin_addr: address, user: address): u64 acquires Config {
-        let cfg = borrow_global<Config<AufiCoinType, SubCoinType>>(admin_addr);
+    public fun view_epoch_start(admin_addr: address, user: address): u64 acquires Config {
+        let cfg = borrow_global<Config>(admin_addr);
         let ku = key_addr(user);
         get_epoch_start(&cfg.epoch_start_ts, &ku)
     }
-
-    #[view]
-    public fun view_pending_amplify_rewards<AufiCoinType, SubCoinType>(admin_addr: address, user: address): u64 acquires Config {
-        let cfg = borrow_global<Config<AufiCoinType, SubCoinType>>(admin_addr);
-        let ku = key_addr(user);
-        get_pending(&cfg.pending_amplify_rewards, &ku)
-    }
-
 }
